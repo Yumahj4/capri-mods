@@ -1,0 +1,183 @@
+// capri-mod: 1
+// id: restart
+// name: Restart Capri
+// version: 1.0.1
+// author: Yuma
+// description: Adds a "Restart Capri" entry to the right-click menu (and the "restart capri" command)
+
+using System;
+using System.ComponentModel;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Reflection;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Windows.Forms;
+using CapriDesktop;
+
+public sealed class RestartCapri : ICapriMod
+{
+    private const string ItemTag = "restart-capri";
+    private readonly object gate = new object();
+    private readonly Dictionary<ContextMenuStrip, CancelEventHandler> hooked = new Dictionary<ContextMenuStrip, CancelEventHandler>();
+    private ICapriHost host;
+    private Thread watcher;
+    private bool stopped = true;
+    private int generation;
+
+    private static readonly Regex RxRestart = new Regex(
+        @"\b(?:restart|reboot|relaunch|red[eé]marre[rz]?|relance[rz]?)\s+(?:capri)\b",
+        RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
+
+    public void Start(ICapriHost capri)
+    {
+        int epoch;
+        lock (gate)
+        {
+            generation++;
+            epoch = generation;
+            host = capri;
+            stopped = false;
+            watcher = new Thread(new ThreadStart(delegate { Watch(epoch); }));
+            watcher.IsBackground = true;
+            watcher.Name = "Capri Restart menu watcher";
+            watcher.Start();
+        }
+        capri.Log("Restart Capri 1.0.2 ready.");
+    }
+
+    public bool Heard(string words)
+    {
+        if (string.IsNullOrWhiteSpace(words) || !RxRestart.IsMatch(words)) return false;
+        lock (gate) { if (stopped) return false; }
+        DoRestart();
+        return true;
+    }
+
+    public void Stop()
+    {
+        List<KeyValuePair<ContextMenuStrip, CancelEventHandler>> list;
+        lock (gate)
+        {
+            stopped = true;
+            generation++;
+            watcher = null;
+            host = null;
+            list = new List<KeyValuePair<ContextMenuStrip, CancelEventHandler>>(hooked);
+            hooked.Clear();
+        }
+        foreach (KeyValuePair<ContextMenuStrip, CancelEventHandler> kv in list)
+        {
+            ContextMenuStrip m = kv.Key;
+            CancelEventHandler h = kv.Value;
+            try
+            {
+                m.Opening -= h;
+                if (m.IsHandleCreated && !m.IsDisposed)
+                    m.BeginInvoke(new MethodInvoker(delegate { RemoveItems(m); }));
+                else RemoveItems(m);
+            }
+            catch (Exception) { }
+        }
+    }
+
+    private void DoRestart()
+    {
+        ICapriHost h;
+        lock (gate) h = host;
+        try
+        {
+            string exe = Process.GetCurrentProcess().MainModule.FileName;
+            if (h != null) h.Say("Back in a sec.");
+
+            ProcessStartInfo psi = new ProcessStartInfo("cmd.exe",
+                "/c ping -n 6 127.0.0.1 >nul & start \"\" \"" + exe + "\"");
+            psi.CreateNoWindow = true;
+            psi.UseShellExecute = false;
+            psi.WorkingDirectory = System.IO.Path.GetDirectoryName(exe);
+            Process.Start(psi);
+            Thread.Sleep(600);
+
+            Form main = null;
+            try { if (Application.OpenForms.Count > 0) main = Application.OpenForms[0]; } catch (Exception) { }
+            if (main != null && main.IsHandleCreated && !main.IsDisposed)
+                main.BeginInvoke(new MethodInvoker(delegate { Application.Exit(); }));
+            else
+                Application.Exit();
+
+            Thread.Sleep(4000);
+            Environment.Exit(0);
+        }
+        catch (Exception) { }
+    }
+
+    private bool IsStopped(int epoch) { lock (gate) return stopped || generation != epoch; }
+
+    private void Watch(int epoch)
+    {
+        while (!IsStopped(epoch))
+        {
+            try { Scan(epoch); }
+            catch (Exception) { }
+            for (int i = 0; i < 20 && !IsStopped(epoch); i++) Thread.Sleep(100);
+        }
+    }
+
+    private void Scan(int epoch)
+    {
+        List<Form> forms = new List<Form>();
+        try { foreach (Form f in Application.OpenForms) forms.Add(f); }
+        catch (InvalidOperationException) { return; }
+
+        foreach (Form form in forms)
+        {
+            if (form.IsDisposed) continue;
+            try
+            {
+                Hook(form.ContextMenuStrip, epoch);
+                foreach (FieldInfo fi in form.GetType().GetFields(
+                    BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public))
+                {
+                    object v;
+                    try { v = fi.GetValue(form); } catch { continue; }
+                    ContextMenuStrip cms = v as ContextMenuStrip;
+                    NotifyIcon ni = v as NotifyIcon;
+                    if (cms != null) Hook(cms, epoch);
+                    else if (ni != null) Hook(ni.ContextMenuStrip, epoch);
+                }
+                foreach (Control c in form.Controls) Hook(c.ContextMenuStrip, epoch);
+            }
+            catch (Exception) { }
+        }
+    }
+
+    private void Hook(ContextMenuStrip menu, int epoch)
+    {
+        if (menu == null || menu.IsDisposed) return;
+        lock (gate)
+        {
+            if (stopped || generation != epoch || hooked.ContainsKey(menu)) return;
+            CancelEventHandler handler = delegate { AddItem(menu); };
+            hooked[menu] = handler;
+            menu.Opening += handler;
+        }
+    }
+
+    private void AddItem(ContextMenuStrip menu)
+    {
+        foreach (ToolStripItem existing in menu.Items)
+            if (ItemTag.Equals(existing.Tag)) return;
+
+        ToolStripMenuItem item = new ToolStripMenuItem("Restart Capri");
+        item.Tag = ItemTag;
+        item.Click += delegate { ThreadPool.QueueUserWorkItem(delegate { DoRestart(); }); };
+        menu.Items.Add(new ToolStripSeparator { Tag = ItemTag });
+        menu.Items.Add(item);
+    }
+
+    private static void RemoveItems(ContextMenuStrip menu)
+    {
+        for (int i = menu.Items.Count - 1; i >= 0; i--)
+            if (ItemTag.Equals(menu.Items[i].Tag)) menu.Items.RemoveAt(i);
+    }
+}
